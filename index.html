@@ -1329,7 +1329,7 @@ let gAccessToken = null;
 let gSheetId = null;
 let tokenClient = null;
 
-const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
+const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly';
 const SHEET_TITLE = 'FleetTrack Data';
 const TAB_VEHICLES = 'Vehicles';
 const TAB_ENTRIES  = 'Entries';
@@ -1392,15 +1392,31 @@ async function ensureSheetExists() {
   }
 }
 
-async function createSpreadsheet() {
-  const r = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+async function findOrCreateSpreadsheet() {
+  // Search Google Drive for an existing FleetTrack Data spreadsheet
+  setAuthStatus('syncing', 'Looking for existing spreadsheet…');
+  const query = encodeURIComponent(`name='${SHEET_TITLE}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc`, {
+    headers: { Authorization: 'Bearer ' + gAccessToken }
+  });
+  if (!r.ok) throw new Error('Drive search failed: ' + r.status);
+  const data = await r.json();
+
+  if (data.files && data.files.length > 0) {
+    // Found existing sheet — use the most recently modified one
+    return { id: data.files[0].id, isNew: false };
+  }
+
+  // None found — create a new one
+  setAuthStatus('syncing', 'Creating new spreadsheet…');
+  const cr = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + gAccessToken, 'Content-Type': 'application/json' },
     body: JSON.stringify({ properties: { title: SHEET_TITLE } })
   });
-  if (!r.ok) throw new Error('Failed to create spreadsheet');
-  const data = await r.json();
-  return data.spreadsheetId;
+  if (!cr.ok) throw new Error('Failed to create spreadsheet');
+  const cd = await cr.json();
+  return { id: cd.spreadsheetId, isNew: true };
 }
 
 // Convert a row array → object using headers
@@ -1572,17 +1588,18 @@ function initGoogleAuth(clientId) {
       document.getElementById('auth-signout-btn').style.display = '';
       document.getElementById('auth-setup-btn').style.display = 'none';
 
-      // Get or create spreadsheet
+      // Find or create spreadsheet — always search Drive so mobile works even if localStorage is wiped
       try {
+        const { id, isNew } = await findOrCreateSpreadsheet();
+        gSheetId = id;
+
+        // Cache sheetId in localStorage as a hint (not relied upon)
         const cfg = getConfig() || {};
-        if (!cfg.sheetId) {
-          setAuthStatus('syncing', 'Creating spreadsheet…');
-          cfg.sheetId = await createSpreadsheet();
-          saveConfig(cfg);
-        }
-        gSheetId = cfg.sheetId;
+        cfg.sheetId = id;
+        saveConfig(cfg);
+
         await loadFromSheets();
-        await migrateLegacyData();
+        if (isNew) await migrateLegacyData();
         populateVehicleSelects();
         refreshPage(state.currentPage);
       } catch(e) {
