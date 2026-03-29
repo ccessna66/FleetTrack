@@ -793,9 +793,23 @@
         <p>Paste the Client ID you copied in Step 4. It will be saved in your browser only.</p>
         <div class="setup-input-row">
           <input id="setup-client-id" placeholder="xxxxxxxxxxxx.apps.googleusercontent.com">
-          <button class="btn btn-primary" onclick="saveClientId()">Save &amp; Connect</button>
         </div>
       </div>
+    </div>
+    <div class="step" style="margin-top:16px">
+      <div class="step-num" style="background:var(--accent2);color:#000">8</div>
+      <div class="step-body">
+        <strong>Already have a FleetTrack spreadsheet? Pin its ID <span style="color:var(--muted);font-weight:400">(optional — for syncing across devices)</span></strong>
+        <p>Open your existing FleetTrack spreadsheet in Google Sheets. Copy the long ID from the URL:<br>
+        <code>docs.google.com/spreadsheets/d/<strong style="color:var(--accent)">THIS_PART</strong>/edit</code><br><br>
+        Paste it below so this device always connects to the same sheet as your other devices.</p>
+        <div class="setup-input-row" style="margin-top:10px">
+          <input id="setup-sheet-id" placeholder="Paste Sheet ID here (optional)">
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:20px">
+      <button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px" onclick="saveClientId()">Save &amp; Connect</button>
     </div>
     <hr class="setup-divider">
     <div class="setup-note">
@@ -809,8 +823,36 @@
   <div class="auth-dot" id="auth-dot"></div>
   <span class="auth-label" id="auth-label">Not connected</span>
   <a id="auth-sheet-link" class="auth-sheet-link" href="#" target="_blank" style="display:none">📊 Open Sheet</a>
+  <button class="auth-signout" onclick="showPinSheet()" id="auth-pin-btn" style="display:none" title="Link to an existing spreadsheet">📌 Pin Sheet</button>
   <button class="auth-signout" onclick="signOut()" id="auth-signout-btn" style="display:none">Sign Out</button>
   <button class="btn btn-ghost btn-sm" onclick="showSetup()" id="auth-setup-btn" style="display:none">⚙ Setup</button>
+</div>
+
+<!-- PIN SHEET MODAL -->
+<div class="modal-overlay" id="modal-pin-sheet">
+  <div class="modal" style="width:480px">
+    <div class="modal-head">
+      <h3>PIN SPREADSHEET</h3>
+      <button class="close-btn" onclick="closeModal('modal-pin-sheet')">×</button>
+    </div>
+    <div class="modal-body">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.6">
+        Use this to sync with a spreadsheet created on another device.<br>
+        Open your FleetTrack sheet in Google Sheets and copy the ID from the URL:<br><br>
+        <code style="background:var(--surface2);padding:4px 8px;border-radius:3px;font-size:11px;color:var(--accent2)">
+          docs.google.com/spreadsheets/d/<strong style="color:var(--accent)">COPY_THIS_PART</strong>/edit
+        </code>
+      </p>
+      <div class="form-group">
+        <label>Sheet ID</label>
+        <input id="pin-sheet-id-input" placeholder="Paste your Sheet ID here" style="font-family:var(--font-mono);font-size:12px">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-pin-sheet')">Cancel</button>
+      <button class="btn btn-primary" onclick="savePinnedSheet()">Connect to This Sheet</button>
+    </div>
+  </div>
 </div>
 
 <div class="app-shell">
@@ -1403,38 +1445,48 @@ async function ensureSheetExists() {
 }
 
 async function findOrCreateSpreadsheet() {
-  // drive.file scope only lets us see files this app created.
-  // Search for an existing FleetTrack spreadsheet among those files.
-  setAuthStatus('syncing', 'Looking for existing spreadsheet…');
-
-  const query = encodeURIComponent(
-    `name='${SHEET_TITLE}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`
-  );
-  const r = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc`,
-    { headers: { Authorization: 'Bearer ' + gAccessToken } }
-  );
-
-  if (r.ok) {
-    const data = await r.json();
-    if (data.files && data.files.length > 0) {
-      return { id: data.files[0].id, isNew: false };
-    }
-  }
-  // 403 or empty — fall back to cached sheetId from localStorage if available
   const cfg = getConfig() || {};
+
+  // 1. Pinned Sheet ID takes absolute priority — always use it if set
+  if (cfg.pinnedSheetId) {
+    setAuthStatus('syncing', 'Connecting to pinned spreadsheet…');
+    const check = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${cfg.pinnedSheetId}?fields=spreadsheetId`,
+      { headers: { Authorization: 'Bearer ' + gAccessToken } }
+    );
+    if (check.ok) return { id: cfg.pinnedSheetId, isNew: false };
+    // Pinned sheet not accessible — fall through to other methods
+    showToast('Pinned sheet not accessible, searching for another…', 'error');
+  }
+
+  // 2. Try Drive search (works for files this app created in this browser)
+  setAuthStatus('syncing', 'Looking for existing spreadsheet…');
+  try {
+    const query = encodeURIComponent(
+      `name='${SHEET_TITLE}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`
+    );
+    const r = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc`,
+      { headers: { Authorization: 'Bearer ' + gAccessToken } }
+    );
+    if (r.ok) {
+      const data = await r.json();
+      if (data.files && data.files.length > 0) {
+        return { id: data.files[0].id, isNew: false };
+      }
+    }
+  } catch {}
+
+  // 3. Cached sheetId from localStorage
   if (cfg.sheetId) {
-    // Verify the cached sheet is still accessible
     const check = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${cfg.sheetId}?fields=spreadsheetId`,
       { headers: { Authorization: 'Bearer ' + gAccessToken } }
     );
-    if (check.ok) {
-      return { id: cfg.sheetId, isNew: false };
-    }
+    if (check.ok) return { id: cfg.sheetId, isNew: false };
   }
 
-  // Nothing found — create a new spreadsheet
+  // 4. Nothing found — create a brand new spreadsheet
   setAuthStatus('syncing', 'Creating new spreadsheet…');
   const cr = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
     method: 'POST',
@@ -1574,6 +1626,7 @@ function showSetup() {
   document.getElementById('setup-overlay').style.display = 'flex';
   const cfg = getConfig();
   if (cfg?.clientId) document.getElementById('setup-client-id').value = cfg.clientId;
+  if (cfg?.pinnedSheetId) document.getElementById('setup-sheet-id').value = cfg.pinnedSheetId;
 }
 function hideSetup() { document.getElementById('setup-overlay').style.display = 'none'; }
 
@@ -1585,9 +1638,53 @@ function saveClientId() {
   }
   const cfg = getConfig() || {};
   cfg.clientId = id;
+  // Optional pinned sheet ID
+  const pinnedSheet = document.getElementById('setup-sheet-id')?.value.trim();
+  if (pinnedSheet) cfg.pinnedSheetId = pinnedSheet;
   saveConfig(cfg);
   hideSetup();
   initGoogleAuth(id);
+}
+
+function showPinSheet() {
+  const cfg = getConfig() || {};
+  document.getElementById('pin-sheet-id-input').value = cfg.pinnedSheetId || '';
+  openModal('modal-pin-sheet');
+}
+
+async function savePinnedSheet() {
+  const raw = document.getElementById('pin-sheet-id-input').value.trim();
+  // Accept full URL or just the ID
+  const id = raw.includes('/spreadsheets/d/')
+    ? raw.split('/spreadsheets/d/')[1].split('/')[0]
+    : raw;
+
+  if (!id) { alert('Please paste a Sheet ID or URL.'); return; }
+
+  // Verify it's accessible before saving
+  setAuthStatus('syncing', 'Verifying spreadsheet…');
+  closeModal('modal-pin-sheet');
+  try {
+    const check = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=spreadsheetId,properties/title`,
+      { headers: { Authorization: 'Bearer ' + gAccessToken } }
+    );
+    if (!check.ok) throw new Error('Could not access that spreadsheet (status ' + check.status + '). Make sure you are signed in with the correct Google account.');
+    const cfg = getConfig() || {};
+    cfg.pinnedSheetId = id;
+    cfg.sheetId = id;
+    saveConfig(cfg);
+    gSheetId = id;
+    document.getElementById('auth-sheet-link').href = `https://docs.google.com/spreadsheets/d/${id}`;
+    document.getElementById('auth-sheet-link').style.display = '';
+    await loadFromSheets();
+    populateVehicleSelects();
+    refreshPage(state.currentPage);
+    showToast('✓ Pinned to spreadsheet successfully', 'success');
+  } catch(e) {
+    setAuthStatus('error', e.message);
+    showToast(e.message, 'error');
+  }
 }
 
 function initGoogleAuth(clientId) {
@@ -1613,6 +1710,7 @@ function initGoogleAuth(clientId) {
       } catch {}
 
       document.getElementById('auth-signout-btn').style.display = '';
+      document.getElementById('auth-pin-btn').style.display = '';
       document.getElementById('auth-setup-btn').style.display = 'none';
 
       // Find or create spreadsheet — always search Drive so mobile works even if localStorage is wiped
