@@ -1329,7 +1329,7 @@ let gAccessToken = null;
 let gSheetId = null;
 let tokenClient = null;
 
-const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly';
+const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
 const SHEET_TITLE = 'FleetTrack Data';
 const TAB_VEHICLES = 'Vehicles';
 const TAB_ENTRIES  = 'Entries';
@@ -1388,33 +1388,60 @@ async function ensureSheetExists() {
     // Write headers
     await sheetsWrite(TAB_VEHICLES + '!A1', [VEHICLE_HEADERS]);
     await sheetsWrite(TAB_ENTRIES  + '!A1', [ENTRY_HEADERS]);
-    await sheetsWrite(TAB_META     + '!A1', [['key','value'],['version','1']]);
+    await sheetsWrite(TAB_META     + '!A1', [['key','value'],['version','1'],['sheetId', gSheetId]]);
+  } else {
+    // Ensure sheetId is recorded in Meta even on existing sheets
+    try {
+      const meta = await sheetsGet(TAB_META + '!A1:B10');
+      const rows = meta.values || [];
+      const hasId = rows.some(r => r[0] === 'sheetId');
+      if (!hasId) {
+        await sheetsWrite(TAB_META + '!A' + (rows.length + 1), [['sheetId', gSheetId]]);
+      }
+    } catch {}
   }
 }
 
 async function findOrCreateSpreadsheet() {
-  // Search Google Drive for an existing FleetTrack Data spreadsheet
+  // drive.file scope only lets us see files this app created.
+  // Search for an existing FleetTrack spreadsheet among those files.
   setAuthStatus('syncing', 'Looking for existing spreadsheet…');
-  const query = encodeURIComponent(`name='${SHEET_TITLE}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
-  const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc`, {
-    headers: { Authorization: 'Bearer ' + gAccessToken }
-  });
-  if (!r.ok) throw new Error('Drive search failed: ' + r.status);
-  const data = await r.json();
 
-  if (data.files && data.files.length > 0) {
-    // Found existing sheet — use the most recently modified one
-    return { id: data.files[0].id, isNew: false };
+  const query = encodeURIComponent(
+    `name='${SHEET_TITLE}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`
+  );
+  const r = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc`,
+    { headers: { Authorization: 'Bearer ' + gAccessToken } }
+  );
+
+  if (r.ok) {
+    const data = await r.json();
+    if (data.files && data.files.length > 0) {
+      return { id: data.files[0].id, isNew: false };
+    }
+  }
+  // 403 or empty — fall back to cached sheetId from localStorage if available
+  const cfg = getConfig() || {};
+  if (cfg.sheetId) {
+    // Verify the cached sheet is still accessible
+    const check = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${cfg.sheetId}?fields=spreadsheetId`,
+      { headers: { Authorization: 'Bearer ' + gAccessToken } }
+    );
+    if (check.ok) {
+      return { id: cfg.sheetId, isNew: false };
+    }
   }
 
-  // None found — create a new one
+  // Nothing found — create a new spreadsheet
   setAuthStatus('syncing', 'Creating new spreadsheet…');
   const cr = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
     method: 'POST',
     headers: { Authorization: 'Bearer ' + gAccessToken, 'Content-Type': 'application/json' },
     body: JSON.stringify({ properties: { title: SHEET_TITLE } })
   });
-  if (!cr.ok) throw new Error('Failed to create spreadsheet');
+  if (!cr.ok) throw new Error('Failed to create spreadsheet: ' + cr.status);
   const cd = await cr.json();
   return { id: cd.spreadsheetId, isNew: true };
 }
@@ -1663,15 +1690,15 @@ window.addEventListener('load', () => {
 
   const cfg = getConfig();
   if (cfg?.clientId) {
-    // Client ID already configured — auto-init
+    // Restore any cached hints immediately so UI feels responsive
     document.getElementById('setup-client-id').value = cfg.clientId;
     if (cfg.sheetId) {
-      gSheetId = cfg.sheetId;
-      document.getElementById('auth-sheet-link').href = `https://docs.google.com/spreadsheets/d/${gSheetId}`;
+      document.getElementById('auth-sheet-link').href = `https://docs.google.com/spreadsheets/d/${cfg.sheetId}`;
       document.getElementById('auth-sheet-link').style.display = '';
     }
-    setAuthStatus('', 'Click to connect');
-    // Wait for GSI to load then auto-request token
+    setAuthStatus('syncing', cfg.userEmail ? 'Reconnecting as ' + cfg.userEmail + '…' : 'Connecting…');
+
+    // Wait for GSI library to load, then silently re-authenticate (no prompt = no popup if already consented)
     const tryInit = setInterval(() => {
       if (window.google?.accounts?.oauth2) {
         clearInterval(tryInit);
